@@ -1,0 +1,6 @@
+Plugins for Nagios for raising alarms based on Graphite data.
+
+check_graphite_data is from Etsy - https://github.com/etsy/nagios_tools/
+
+check_graphite_disk assumes the data is graphite is from collectd and
+calculates alarms based on the free disk space for every disk reported.
