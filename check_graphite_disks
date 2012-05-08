@@ -1,0 +1,175 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use Data::Dumper;
+use Nagios::Plugin;
+use LWP::Simple;
+use URI;
+use URI::QueryParam;
+use JSON;
+use Getopt::Long;
+
+sub target_wildcards {
+	my ($target) = @_;
+	my @components = split /\./, $target;
+	my @offsets;
+	for my $i (0..$#components) {
+		if ($components[$i] eq '*') {
+			push @offsets, $i;
+		}
+	}
+	return @offsets;
+}
+
+sub get_target_components {
+	my ($target, @offsets) = @_;
+	my @components = split /\./, $target;
+	return @components[@offsets];
+}
+
+sub modify_target {
+	my ($target, $offset) = @_;
+	my @components = split /\./, $target;
+	$components[$offset] = '*';
+	return join '.', @components;
+}
+
+sub check_thres {
+	my ($np, $value) = @_;
+	unless ($np->opts->get('reverse')) {
+		if ($value <= $np->opts->get('critical')) {
+			return CRITICAL;
+		}
+		elsif ($value <= $np->opts->get('warning')) {
+			return WARNING;
+		}
+		else {
+			return OK;
+		}
+	}
+	else {
+		if ($value >= $np->opts->get('critical')) {
+			return CRITICAL;
+		}
+		elsif ($value >= $np->opts->get('warning')) {
+			return WARNING;
+		}
+		else {
+			return OK;
+		}
+	}
+}
+
+sub get_json {
+	my ($uri) = @_;
+	my $data = get $uri || die "No data returned by $uri\n";
+	return from_json( $data );
+}
+
+my $np = Nagios::Plugin->new(
+	shortname => "check_graphite_disks",
+	usage => "Usage: %s ".join(" ", "[ -v|--verbose ]",
+		"[ -t <timeout> ]",
+		"[ -c|--critical=<threshold> ]",
+		"[ -w|--warning=<threshold> ]",
+		"[ -r|--reverse ]",
+		"[ -u|--url ]",
+	),
+);
+$np->add_arg(
+	spec => "url|u=s",
+	help => "URL to Graphite graph",
+	required => 1,
+);
+$np->add_arg(
+	spec => "warning|w=i",
+	help => "Warning threshold",
+	required => 1,
+	default => 10,
+);
+$np->add_arg(
+	spec => "critical|c=i",
+	help => "Critical threshold",
+	required => 1,
+	default => 5,
+);
+$np->add_arg(
+	spec => "reverse|r",
+	help => "Reverse meanings of critical and warning thresholds so that values over them cause alarms",
+);
+
+$np->getopts();
+
+# Test that thresholds make sense
+unless ($np->opts->get('reverse')) {
+	if ($np->opts->get('critical') > $np->opts->get('warning')) {
+		$np->nagios_exit(
+			CRITICAL,
+			"Critical threshold can't be greater than the warning threshold"
+		);
+	}
+}
+else {
+	if ($np->opts->get('critical') < $np->opts->get('warning')) {
+		$np->nagios_exit(
+			CRITICAL,
+			"Critical threshold can't be less than the warning threshold"
+		);
+	}
+}
+
+# Parse the URL and make sure we're always asking for JSON
+my $uri = URI->new( $np->opts->get('url') ) || $np->nagios_exit( UNKNOWN, "Couldn't parse URL" );
+$uri->query_param( format => "json" );
+
+# Get the JSON for the base target and find all the targets
+# we're going to check
+my $data = get_json( $uri );
+my @targets = map { $_->{target} } @{$data};
+@targets || $np->nagios_exit( UNKNOWN, "No targets found" );
+if ($np->opts->verbose) {
+	for my $target (@targets) {
+		print "Found target $target\n";
+	}
+}
+
+# Now query each of the discovered targets
+my $orig_target = $uri->query_param( "target" );
+for my $target (@targets) {
+	my $t_uri = $uri->clone;
+
+	my (@wildcards) = target_wildcards($orig_target);
+	my $offset = $wildcards[-1];
+	my $series = modify_target($target, $offset + 1);
+	$t_uri->query_param(
+		target => "asPercent($target,sumSeries($series))"
+	);
+
+	if ($np->opts->verbose) {
+		print "Checking $t_uri\n";
+	}
+
+	# Unpack the Array of arrays and remove any undefined entries
+	my @data = grep { defined $_->[0] } map { @{ $_->{datapoints} } } @{ get_json( $t_uri ) };
+
+	# Make sure we get the data in time order (unnecessary?) and that we have data...
+	@data = sort { $a->[1] <=> $b->[1] } @data;
+	unless (@data) {
+		$np->add_message(
+			CRITICAL,
+			"No data collected for $target"
+		);
+		next;
+	}
+
+	my ($latest) = pop @data;
+	$np->add_message(
+		check_thres( $np, $latest->[0] ),
+		get_target_components($target, $offset).sprintf(" has %.2f%% free,", $latest->[0])
+	);
+}
+
+my ($code, $message) = $np->check_messages();
+$np->nagios_exit( $code, $message );
